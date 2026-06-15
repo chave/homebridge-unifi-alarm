@@ -61,15 +61,9 @@ class UnifiAlarmAccessory {
 
     this.cookies = null;
     this.csrfToken = null;
-    this.armProfileId = config.armProfileId || null;  // auto-discovered from bootstrap
-    this.isArmed = false;
-
-    this.informationService = accessory.getService(Service.AccessoryInformation)
-      || accessory.addService(Service.AccessoryInformation);
-    this.informationService
-      .setCharacteristic(Characteristic.Manufacturer, "Ubiquiti")
-      .setCharacteristic(Characteristic.Model, "UniFi Protect")
-      .setCharacteristic(Characteristic.SerialNumber, "Unknown");
+    this.profileId = config.armProfileId || null;  // auto-discovered if not set
+    // UniFi Alarm Manager profile state: "disarmed" | "arming" | "armed" | "breached"
+    this.status = "disarmed";
 
     this.securityService = accessory.getService(Service.SecuritySystem)
       || accessory.addService(Service.SecuritySystem, this.name);
@@ -88,23 +82,41 @@ class UnifiAlarmAccessory {
     this.init();
   }
 
-  get baseUrl() {
-    return `https://${this.controller}`;
+  get alarmsBase() {
+    return `https://${this.controller}/api/v2/alarms`;
+  }
+
+  get authHeaders() {
+    return { Cookie: this.cookies, "X-Csrf-Token": this.csrfToken };
   }
 
   currentState() {
     const C = this.Characteristic.SecuritySystemCurrentState;
-    return this.isArmed ? C.AWAY_ARM : C.DISARMED;
+    switch (this.status) {
+      case "armed": return C.AWAY_ARM;
+      case "breached": return C.ALARM_TRIGGERED;
+      // "arming" reports DISARMED so HomeKit shows "Arming…" until it lands.
+      case "arming":
+      case "disarmed":
+      default: return C.DISARMED;
+    }
   }
 
   targetState() {
     const C = this.Characteristic.SecuritySystemTargetState;
-    return this.isArmed ? C.AWAY_ARM : C.DISARM;
+    return this.status === "disarmed" ? C.DISARM : C.AWAY_ARM;
+  }
+
+  updateStates() {
+    this.securityService.updateCharacteristic(
+      this.Characteristic.SecuritySystemCurrentState, this.currentState());
+    this.securityService.updateCharacteristic(
+      this.Characteristic.SecuritySystemTargetState, this.targetState());
   }
 
   async login() {
     const response = await axios.post(
-      `${this.baseUrl}/api/auth/login`,
+      `https://${this.controller}/api/auth/login`,
       { username: this.username, password: this.password },
       { httpsAgent, timeout: 15000, headers: { "Content-Type": "application/json" } }
     );
@@ -113,40 +125,32 @@ class UnifiAlarmAccessory {
       this.cookies = setCookies.map(c => c.split(";")[0]).join("; ");
     }
     this.csrfToken = response.headers["x-csrf-token"];
-    this.log(`[${this.name}] Logged in to UniFi Protect.`);
+    this.log(`[${this.name}] Logged in to UniFi.`);
   }
 
-  async getBootstrap() {
-    const response = await axios.get(`${this.baseUrl}/proxy/protect/api/bootstrap`, {
-      httpsAgent,
-      timeout: 15000,
-      headers: { Cookie: this.cookies, "X-Csrf-Token": this.csrfToken },
+  // Returns the current state string, auto-discovering the profile on first call.
+  async readState() {
+    const response = await axios.get(`${this.alarmsBase}/profiles`, {
+      httpsAgent, timeout: 15000, headers: this.authHeaders,
     });
-    return response.data;
+    const profiles = response.data || [];
+    const profile = this.profileId
+      ? profiles.find(p => p.id === this.profileId)
+      : profiles[0];
+    if (!profile) throw new Error("No alarm profile found");
+    if (!this.profileId) {
+      this.profileId = profile.id;
+      this.log(`[${this.name}] Using arm profile: ${profile.title} (${profile.id})`);
+    }
+    return profile.state;
   }
 
   async init() {
     try {
       await this.login();
-      const bootstrap = await this.getBootstrap();
-      const armMode = bootstrap.nvr?.armMode || {};
-
-      // Auto-discover the profile ID from bootstrap
-      if (!this.armProfileId && armMode.armProfileId) {
-        this.armProfileId = armMode.armProfileId;
-        this.log(`[${this.name}] Discovered arm profile ID: ${this.armProfileId}`);
-      }
-
-      this.isArmed = armMode.status === "armed";
-      this.securityService.updateCharacteristic(
-        this.Characteristic.SecuritySystemCurrentState,
-        this.currentState()
-      );
-      this.securityService.updateCharacteristic(
-        this.Characteristic.SecuritySystemTargetState,
-        this.targetState()
-      );
-      this.log(`[${this.name}] State: ${this.isArmed ? "Armed" : "Disarmed"}`);
+      this.status = await this.readState();
+      this.updateStates();
+      this.log(`[${this.name}] State: ${this.status}`);
     } catch (err) {
       const detail = err.response
         ? `HTTP ${err.response.status}: ${JSON.stringify(err.response.data)}`
@@ -164,21 +168,11 @@ class UnifiAlarmAccessory {
 
   async poll() {
     try {
-      const bootstrap = await this.getBootstrap();
-      const armMode = bootstrap.nvr?.armMode || {};
-      const wasArmed = this.isArmed;
-      this.isArmed = armMode.status === "armed";
-
-      if (wasArmed !== this.isArmed) {
-        this.log(`[${this.name}] State changed: ${this.isArmed ? "Armed" : "Disarmed"}`);
-        this.securityService.updateCharacteristic(
-          this.Characteristic.SecuritySystemCurrentState,
-          this.currentState()
-        );
-        this.securityService.updateCharacteristic(
-          this.Characteristic.SecuritySystemTargetState,
-          this.targetState()
-        );
+      const prev = this.status;
+      this.status = await this.readState();
+      if (prev !== this.status) {
+        this.log(`[${this.name}] State changed: ${this.status}`);
+        this.updateStates();
       }
     } catch (err) {
       if (err.response && err.response.status === 401) {
@@ -194,48 +188,22 @@ class UnifiAlarmAccessory {
     const C = this.Characteristic.SecuritySystemTargetState;
     const arming = value !== C.DISARM;
 
-    try {
-      if (arming) {
-        if (!this.armProfileId) {
-          this.log.error(`[${this.name}] No arm profile ID available.`);
-          return;
-        }
-        await axios.post(
-          `${this.baseUrl}/proxy/protect/api/arm/enable`,
-          { armProfileId: this.armProfileId },
-          {
-            httpsAgent,
-            timeout: 15000,
-            headers: {
-              Cookie: this.cookies,
-              "X-Csrf-Token": this.csrfToken,
-              "Content-Type": "application/json",
-            },
-          }
-        );
-        this.log(`[${this.name}] Armed.`);
-      } else {
-        await axios.post(
-          `${this.baseUrl}/proxy/protect/api/arm/disable`,
-          {},
-          {
-            httpsAgent,
-            timeout: 15000,
-            headers: {
-              Cookie: this.cookies,
-              "X-Csrf-Token": this.csrfToken,
-              "Content-Type": "application/json",
-            },
-          }
-        );
-        this.log(`[${this.name}] Disarmed.`);
-      }
+    if (!this.profileId) {
+      this.log.error(`[${this.name}] No arm profile available.`);
+      return;
+    }
 
-      this.isArmed = arming;
-      this.securityService.updateCharacteristic(
-        this.Characteristic.SecuritySystemCurrentState,
-        this.currentState()
+    try {
+      const action = arming ? "arm" : "disarm";
+      await axios.post(
+        `${this.alarmsBase}/profiles/${this.profileId}/actions/${action}`,
+        {},
+        { httpsAgent, timeout: 15000, headers: { ...this.authHeaders, "Content-Type": "application/json" } }
       );
+      // Optimistic; poll reconciles "arming" -> "armed".
+      this.status = arming ? "arming" : "disarmed";
+      this.log(`[${this.name}] ${arming ? "Arm command sent." : "Disarmed."}`);
+      this.updateStates();
     } catch (err) {
       if (err.response && err.response.status === 401) {
         this.log.warn(`[${this.name}] Session expired, re-logging in and retrying...`);
